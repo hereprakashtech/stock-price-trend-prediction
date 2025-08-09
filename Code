@@ -1,0 +1,193 @@
+# Stock Trend Prediction - Complete Notebook
+# Author: (You)
+# Run: Jupyter / Colab / local
+
+# 1) Imports
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score, f1_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+import xgboost as xgb
+import joblib
+import ta  # technical analysis indicators
+
+sns.set_style("darkgrid")
+plt.rcParams['figure.figsize'] = (10,6)
+
+# 2) Parameters - pick symbol and date range
+SYMBOL = "AAPL"            # change to any ticker: "RELIANCE.NS", "MSFT", etc.
+START = "2018-01-01"
+END = "2025-08-01"        # adjust as needed
+
+# 3) Download data
+df = yf.download(SYMBOL, start=START, end=END, progress=False)
+df = df.dropna()
+df.head()
+
+# 4) Basic EDA
+print("Rows:", df.shape[0])
+print(df.tail())
+
+# 5) Plot candlestick for last 60 days
+mpf.plot(df.tail(60), type='candle', volume=True, style='yahoo', title=f"{SYMBOL} - Last 60 Days")
+
+# 6) Feature engineering - Technical indicators (using ta library)
+# Add moving averages
+df['ma5'] = df['Close'].rolling(window=5).mean()
+df['ma10'] = df['Close'].rolling(window=10).mean()
+df['ma20'] = df['Close'].rolling(window=20).mean()
+
+# Momentum / RSI / MACD / Stochastic / ATR / OBV etc using ta
+df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
+macd = ta.trend.MACD(df['Close'])
+df['macd'] = macd.macd()
+df['macd_signal'] = macd.macd_signal()
+
+stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
+df['stoch_k'] = stoch.stoch()
+df['stoch_d'] = stoch.stoch_signal()
+
+df['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+df['obv'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
+
+# Returns and volatility features
+df['returns'] = df['Close'].pct_change()
+df['vol_5'] = df['returns'].rolling(5).std()
+df['vol_20'] = df['returns'].rolling(20).std()
+
+# Lag features
+for lag in [1,2,3,5]:
+    df[f'close_lag_{lag}'] = df['Close'].shift(lag)
+
+# Drop rows with nan (from indicators)
+df = df.dropna().copy()
+print("After feature engineering:", df.shape)
+
+# 7) Labeling: Next-day direction (1 if next close > today's close, else 0)
+df['close_next'] = df['Close'].shift(-1)
+df['target'] = (df['close_next'] > df['Close']).astype(int)
+df = df.dropna(subset=['target']).copy()
+
+# 8) Choose features and target
+feature_cols = [
+    'Open','High','Low','Close','Volume',
+    'ma5','ma10','ma20','rsi','macd','macd_signal',
+    'stoch_k','stoch_d','atr','obv','returns','vol_5','vol_20',
+    'close_lag_1','close_lag_2','close_lag_3','close_lag_5'
+]
+X = df[feature_cols]
+y = df['target']
+
+# 9) Train-test split — important: use time-based split to avoid lookahead
+split_idx = int(0.8 * len(df))
+X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+print("Train size:", X_train.shape, "Test size:", X_test.shape)
+
+# 10) Scaling (fit only on train)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# 11) Model training - baseline Logistic Regression
+lr = LogisticRegression(max_iter=1000)
+lr.fit(X_train_scaled, y_train)
+pred_lr = lr.predict(X_test_scaled)
+proba_lr = lr.predict_proba(X_test_scaled)[:,1]
+
+print("Logistic Regression")
+print("Accuracy:", accuracy_score(y_test, pred_lr))
+print("F1:", f1_score(y_test, pred_lr))
+print(classification_report(y_test, pred_lr))
+
+# 12) Random Forest
+rf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+rf.fit(X_train, y_train)
+pred_rf = rf.predict(X_test)
+proba_rf = rf.predict_proba(X_test)[:,1]
+
+print("Random Forest")
+print("Accuracy:", accuracy_score(y_test, pred_rf))
+print("F1:", f1_score(y_test, pred_rf))
+print(classification_report(y_test, pred_rf))
+
+# 13) XGBoost (often strong for tabular)
+xg = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+xg.fit(X_train_scaled, y_train)
+pred_xg = xg.predict(X_test_scaled)
+proba_xg = xg.predict_proba(X_test_scaled)[:,1]
+
+print("XGBoost")
+print("Accuracy:", accuracy_score(y_test, pred_xg))
+print("F1:", f1_score(y_test, pred_xg))
+print(classification_report(y_test, pred_xg))
+
+# 14) Confusion matrices
+def plot_confmat(y_true, y_pred, title):
+    cm = confusion_matrix(y_true, y_pred)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.show()
+
+plot_confmat(y_test, pred_lr, "Logistic Regression Confusion")
+plot_confmat(y_test, pred_rf, "Random Forest Confusion")
+plot_confmat(y_test, pred_xg, "XGBoost Confusion")
+
+# 15) Feature importance (Random Forest)
+imp = pd.Series(rf.feature_importances_, index=feature_cols).sort_values(ascending=False)
+print("Top features:\n", imp.head(15))
+imp.head(20).plot(kind='bar', figsize=(10,5)); plt.title("Feature importances (RF)"); plt.show()
+
+# 16) Simple backtest strategy: use model prob > threshold to take long next day
+test_dates = X_test.index
+results = pd.DataFrame(index=test_dates)
+results['actual'] = y_test
+results['pred_xg'] = pred_xg
+results['prob_xg'] = proba_xg
+results['close'] = df.loc[test_dates, 'Close']
+
+# Strategy: if prob > 0.6 -> long for next day (buy today close, sell next day close)
+threshold = 0.6
+positions = results['prob_xg'] > threshold
+results['position'] = positions.astype(int)
+
+# compute next day returns
+results['next_return'] = df.loc[test_dates, 'close_next'] / df.loc[test_dates, 'Close'] - 1
+results['strategy_return'] = results['position'] * results['next_return']
+
+# cumulative returns
+results['market_cum'] = (1 + results['next_return']).cumprod()
+results['strategy_cum'] = (1 + results['strategy_return']).cumprod()
+
+plt.figure(figsize=(12,6))
+plt.plot(results.index, results['market_cum'], label='Buy and Hold')
+plt.plot(results.index, results['strategy_cum'], label='Model Strategy')
+plt.legend()
+plt.title(f"Strategy vs Buy&Hold (threshold={threshold})")
+plt.show()
+
+# 17) Save best model, scaler, and feature list
+best_model = xg  # choose based on validation; here XGBoost assumed best
+joblib.dump(best_model, f"{SYMBOL}_trend_xg_model.pkl")
+joblib.dump(scaler, f"{SYMBOL}_scaler.pkl")
+pd.Series(feature_cols).to_csv(f"{SYMBOL}_features.csv", index=False)
+print("Saved model and scaler.")
+
+# 18) Example: predict next day for most recent available day
+latest = df.iloc[-1]
+X_latest = latest[feature_cols].values.reshape(1,-1)
+X_latest_scaled = scaler.transform(X_latest)
+pred_today_prob = best_model.predict_proba(X_latest_scaled)[0,1]
+pred_today = best_model.predict(X_latest_scaled)[0]
+print(f"Predicted prob of Up tomorrow: {pred_today_prob:.3f} -> Direction: {'Up' if pred_today==1 else 'Down'}")
